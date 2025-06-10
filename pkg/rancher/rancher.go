@@ -95,6 +95,8 @@ type Rancher struct {
 	auditLog   *audit.LogWriter
 	authServer *auth.Server
 	opts       *Options
+
+	kubeAggregationReadyChan chan struct{}
 }
 
 func New(ctx context.Context, clientConfg clientcmd.ClientConfig, opts *Options) (*Rancher, error) {
@@ -124,6 +126,11 @@ func New(ctx context.Context, clientConfg clientcmd.ClientConfig, opts *Options)
 	wranglerContext, err := wrangler.NewContext(ctx, clientConfg, restConfig)
 	if err != nil {
 		return nil, err
+	}
+
+	// Check for deprecated RKE1 resources in the cluster
+	if err := validateRKE1Resources(wranglerContext); err != nil {
+		return nil, fmt.Errorf("rke1 pre-upgrade validation failed: %w", err)
 	}
 
 	if err := dashboarddata.EarlyData(ctx, wranglerContext.K8s); err != nil {
@@ -202,7 +209,10 @@ func New(ctx context.Context, clientConfg clientcmd.ClientConfig, opts *Options)
 		return nil, err
 	}
 
-	extensionAPIServer, err := ext.NewExtensionAPIServer(ctx, wranglerContext, ext.DefaultOptions())
+	extensionOpts := ext.DefaultOptions()
+	extensionOpts.KubeAggregatorReadyChan = make(chan struct{})
+
+	extensionAPIServer, err := ext.NewExtensionAPIServer(ctx, wranglerContext, extensionOpts)
 	if err != nil {
 		return nil, fmt.Errorf("extension api server: %w", err)
 	}
@@ -270,11 +280,12 @@ func New(ctx context.Context, clientConfg clientcmd.ClientConfig, opts *Options)
 			additionalAPI,
 			requests.NewRequireAuthenticatedFilter("/v1/", "/v1/management.cattle.io.setting"),
 		}.Handler(steve),
-		Wrangler:   wranglerContext,
-		Steve:      steve,
-		auditLog:   auditLogWriter,
-		authServer: authServer,
-		opts:       opts,
+		Wrangler:                 wranglerContext,
+		Steve:                    steve,
+		auditLog:                 auditLogWriter,
+		authServer:               authServer,
+		opts:                     opts,
+		kubeAggregationReadyChan: extensionOpts.KubeAggregatorReadyChan,
 	}, nil
 }
 
@@ -332,6 +343,16 @@ func (r *Rancher) ListenAndServe(ctx context.Context) error {
 
 	r.startAggregation(ctx)
 	go r.Steve.StartAggregation(ctx)
+
+	logrus.Info("Waiting for imperative API to be ready")
+
+	select {
+	case <-r.kubeAggregationReadyChan:
+		logrus.Info("kube-apierver connected to imperative api")
+	case <-time.After(time.Minute * 2):
+		logrus.Fatal("kube-apiServer did not contact the rancher imperative api in time, please ensure k8s is configured to support api extension")
+	}
+
 	if err := tls.ListenAndServe(ctx, r.Wrangler.RESTConfig,
 		r.Auth(r.Handler),
 		r.opts.BindHost,
@@ -617,4 +638,67 @@ func migrateEncryptionConfig(ctx context.Context, restConfig *rest.Config) error
 		allErrors = errors.Join(err, allErrors)
 	}
 	return allErrors
+}
+
+// checks for deprecated RKE1 resources in the cluster to ensure that the cluster is not using any deprecated resources.
+func validateRKE1Resources(wranglerContext *wrangler.Context) error {
+	resources, err := checkForRKE1Resources(wranglerContext)
+	if err != nil {
+		return fmt.Errorf("checking for RKE1 resources: %w", err)
+	}
+	if len(resources) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf("Rancher v2.12+ does not support RKE1. Detected RKE1-related resources (listed below).\nPlease migrate these clusters to RKE2 or K3s, or delete the related resources. More info: https://www.suse.com/c/rke-end-of-life-by-july-2025-replatform-to-rke2-or-k3s/\n - %s", strings.Join(resources, "\n - "))
+}
+
+// checkForRKE1Resources scans for deprecated RKE1 (Rancher Kubernetes Engine v1) resources in the Rancher management context.
+func checkForRKE1Resources(wranglerContext *wrangler.Context) ([]string, error) {
+	var found []string
+
+	logrus.Infof("Scanning NodeTemplates in namespace: %s, group: nodetemplates.management.cattle.io", namespace.NodeTemplateGlobalNamespace)
+	logrus.Infof("Scanning ClusterTemplates in namespace: %s, group: clustertemplates.management.cattle.io", namespace.GlobalNamespace)
+
+	// Check for RKE1 clusters
+	clusters, err := wranglerContext.Mgmt.Cluster().List(metav1.ListOptions{})
+	if k8serror.IsNotFound(err) {
+		clusters = &v3.ClusterList{}
+	} else if err != nil {
+		return nil, fmt.Errorf("error checking RKE1 clusters: %w", err)
+	}
+
+	for _, cluster := range clusters.Items {
+		if cluster.Spec.RancherKubernetesEngineConfig != nil {
+			found = append(found, fmt.Sprintf("Cluster: name=%s, displayName=%s", cluster.Name, cluster.Spec.DisplayName))
+		}
+	}
+
+	// NodeTemplates in the global node template namespace
+	nodeTemplates, err := wranglerContext.Mgmt.NodeTemplate().List(namespace.NodeTemplateGlobalNamespace, metav1.ListOptions{})
+
+	if k8serror.IsNotFound(err) {
+		nodeTemplates = &v3.NodeTemplateList{}
+	} else if err != nil {
+		return nil, fmt.Errorf("error checking nodeTemplates: %w", err)
+	}
+
+	for _, obj := range nodeTemplates.Items {
+		found = append(found, fmt.Sprintf("NodeTemplate: name=%s, displayName=%s", obj.Name, obj.Spec.DisplayName))
+	}
+
+	// ClusterTemplates in the global namespace
+	clusterTemplates, err := wranglerContext.Mgmt.ClusterTemplate().List(namespace.GlobalNamespace, metav1.ListOptions{})
+
+	if k8serror.IsNotFound(err) {
+		clusterTemplates = &v3.ClusterTemplateList{}
+	} else if err != nil {
+		return nil, fmt.Errorf("error checking clusterTemplates: %w", err)
+	}
+
+	for _, obj := range clusterTemplates.Items {
+		found = append(found, fmt.Sprintf("ClusterTemplate: name=%s, displayName=%s", obj.Name, obj.Spec.DisplayName))
+	}
+
+	return found, nil
 }
